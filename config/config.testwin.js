@@ -8,11 +8,12 @@ config.test = {
     database: "codepush_test",
     host: "127.0.0.1",
     port: 3306,
-    dialect: "mysql"
+    dialect: "mysql",
+    logging: false
   },
   local: {
     storageDir: os.tmpdir(),
-    downloadUrl: "http://localhost:3000/download",
+    downloadUrl: "http://127.0.0.1:3000/download",
     public: '/download'
   },
   jwt: {
@@ -44,6 +45,14 @@ config.test = {
         return Math.max(options.attempt * 100, 3000);
       }
     }
+  }
+}
+config.test.log4js = {
+  appenders: {console: { type: 'console'}},
+  categories : {
+    "default": { appenders: ['console'], level:'error'},
+    "startup": { appenders: ['console'], level:'info'},
+    "http": { appenders: ['console'], level:'info'}
   }
 }
 module.exports = config;

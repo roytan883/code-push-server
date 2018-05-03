@@ -4,6 +4,7 @@ var models = require('../../models');
 var _ = require('lodash');
 var common = require('../utils/common');
 var factory = require('../utils/factory');
+var AppError = require('../app-error');
 
 var proto = module.exports = function (){
   function ClientManager() {
@@ -24,14 +25,15 @@ proto.clearUpdateCheckCache = function(deploymentKey, appVersion, label, package
   let redisCacheKey = this.getUpdateCheckCacheKey(deploymentKey, appVersion, label, packageHash);
   var client = factory.getRedisClient("default");
   return client.keysAsync(redisCacheKey)
-  .then(function(data) {
+  .then((data) => {
     if (_.isArray(data)) {
-      return Promise.map(data, function(key){
+      return Promise.map(data, (key) => {
         return client.delAsync(key);
       });
     }
     return null;
-  });
+  })
+  .finally(() => client.quit());
 }
 
 proto.updateCheckFromCache = function(deploymentKey, appVersion, label, packageHash) {
@@ -43,7 +45,7 @@ proto.updateCheckFromCache = function(deploymentKey, appVersion, label, packageH
   let redisCacheKey = self.getUpdateCheckCacheKey(deploymentKey, appVersion, label, packageHash);
   var client = factory.getRedisClient("default");
   return client.getAsync(redisCacheKey)
-  .then(function(data){
+  .then((data) => {
     if (data) {
       try {
         var obj = JSON.parse(data);
@@ -52,7 +54,7 @@ proto.updateCheckFromCache = function(deploymentKey, appVersion, label, packageH
       }
     }
     return self.updateCheck(deploymentKey, appVersion, label, packageHash)
-    .then(function(rs){
+    .then((rs) => {
       try {
         var strRs = JSON.stringify(rs);
         client.setexAsync(redisCacheKey, EXPIRED, strRs);
@@ -61,11 +63,13 @@ proto.updateCheckFromCache = function(deploymentKey, appVersion, label, packageH
       return rs;
     });
   })
+  .finally(() => client.quit());
 }
 
 proto.updateCheck = function(deploymentKey, appVersion, label, packageHash) {
   var rs = {
     downloadURL: "",
+    downloadUrl: "",
     description: "",
     isAvailable: false,
     isMandatory: false,
@@ -77,30 +81,30 @@ proto.updateCheck = function(deploymentKey, appVersion, label, packageHash) {
     shouldRunBinaryVersion: false
   };
   if (_.isEmpty(deploymentKey) || _.isEmpty(appVersion)) {
-    return Promise.reject(new Error("please input deploymentKey and appVersion"))
+    return Promise.reject(new AppError.AppError("please input deploymentKey and appVersion"))
   }
   return models.Deployments.findOne({where: {deployment_key: deploymentKey}})
-  .then(function (dep) {
+  .then((dep) => {
     if (_.isEmpty(dep)) {
-      throw new Error('does not found deployment');
+      throw new AppError.AppError('does not found deployment');
     }
     return models.DeploymentsVersions.findOne({where: {deployment_id: dep.id, app_version: appVersion}});
   })
-  .then(function (deploymentsVersions) {
+  .then((deploymentsVersions) => {
     var packageId = _.get(deploymentsVersions, 'current_package_id', 0);
     if (_.eq(packageId, 0) ) {
       return;
     }
-    var downloadURL = common.getDownloadUrl();
     return models.Packages.findById(packageId)
-    .then(function (packages) {
+    .then((packages) => {
       if (packages
         && _.eq(packages.deployment_id, deploymentsVersions.deployment_id)
         && !_.eq(packages.package_hash, packageHash)) {
-        rs.downloadURL = `${downloadURL}/${_.get(packages, 'blob_url')}`;
+        rs.downloadURL = common.getBlobDownloadUrl(_.get(packages, 'blob_url'));
+        rs.downloadUrl = common.getBlobDownloadUrl(_.get(packages, 'blob_url'));
         rs.description = _.get(packages, 'description', '');
         rs.isAvailable = true;
-        rs.isMandatory = _.eq(deploymentsVersions.is_mandatory, 1) ? true : false;
+        rs.isMandatory = _.eq(packages.is_mandatory, 1) ? true : false;
         rs.appVersion = appVersion;
         rs.packageHash = _.get(packages, 'package_hash', '');
         rs.label = _.get(packages, 'label', '');
@@ -110,13 +114,14 @@ proto.updateCheck = function(deploymentKey, appVersion, label, packageHash) {
       return packages;
     })
 
-    .then(function (packages) {
+    .then((packages) => {
       //差异化更新
       if (!_.isEmpty(packages) && !_.eq(_.get(packages, 'package_hash', ""), packageHash)) {
         return models.PackagesDiff.findOne({where: {package_id:packages.id, diff_against_package_hash: packageHash}})
-        .then(function (diffPackage) {
+        .then((diffPackage) => {
           if (!_.isEmpty(diffPackage)) {
-            rs.downloadURL = `${downloadURL}/${_.get(diffPackage, 'diff_blob_url')}`;
+            rs.downloadURL = common.getBlobDownloadUrl(_.get(diffPackage, 'diff_blob_url'));
+            rs.downloadUrl = common.getBlobDownloadUrl(_.get(diffPackage, 'diff_blob_url'));
             rs.packageSize = _.get(diffPackage, 'diff_size', 0);
           }
           return;
@@ -126,25 +131,25 @@ proto.updateCheck = function(deploymentKey, appVersion, label, packageHash) {
       }
     });
   })
-  .then(function () {
+  .then(() => {
     return rs;
   });
 };
 
 proto.getPackagesInfo = function (deploymentKey, label) {
   if (_.isEmpty(deploymentKey) || _.isEmpty(label)) {
-    return Promise.reject(new Error("please input deploymentKey and appVersion"))
+    return Promise.reject(new AppError.AppError("please input deploymentKey and label"))
   }
   return models.Deployments.findOne({where: {deployment_key: deploymentKey}})
-  .then(function (dep) {
+  .then((dep) => {
     if (_.isEmpty(dep)) {
-      throw new Error('does not found deployment');
+      throw new AppError.AppError('does not found deployment');
     }
     return models.Packages.findOne({where: {deployment_id: dep.id, label: label}});
   })
-  .then(function (packages) {
+  .then((packages) => {
     if (_.isEmpty(packages)) {
-      throw new Error('does not found packages');
+      throw new AppError.AppError('does not found packages');
     }
     return packages;
   });
@@ -152,14 +157,14 @@ proto.getPackagesInfo = function (deploymentKey, label) {
 
 proto.reportStatusDownload = function(deploymentKey, label, clientUniqueId) {
   return this.getPackagesInfo(deploymentKey, label)
-  .then(function (packages) {
+  .then((packages) => {
     return models.PackagesMetrics.addOneOnDownloadById(packages.id);
   });
 };
 
 proto.reportStatusDeploy = function (deploymentKey, label, clientUniqueId, others) {
   return this.getPackagesInfo(deploymentKey, label)
-  .then(function (packages) {
+  .then((packages) => {
     var status =  _.get(others, "status");
     var packageId = packages.id;
     if (_.eq(status, "DeploymentSucceeded")) {

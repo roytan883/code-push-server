@@ -5,6 +5,9 @@ var fs = require('fs');
 var Promise = require('bluebird');
 var qetag = require('../utils/qetag');
 var _ = require('lodash');
+var log4js = require('log4js');
+var log = log4js.getLogger("cps:utils:security");
+var AppError = require('../app-error');
 
 var randToken = require('rand-token').generator({
   chars: '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ',
@@ -37,14 +40,14 @@ security.parseToken = function(token) {
 }
 
 security.fileSha256 = function (file) {
-  return new Promise(function (resolve, reject) {
+  return new Promise((resolve, reject) => {
     var rs = fs.createReadStream(file);
     var hash = crypto.createHash('sha256');
     rs.on('data', hash.update.bind(hash));
-    rs.on('error', function(e){
+    rs.on('error', (e) => {
       reject(e);
     });
-    rs.on('end', function () {
+    rs.on('end', () => {
       resolve(hash.digest('hex'));
     });
   });
@@ -58,39 +61,45 @@ security.stringSha256Sync = function (contents) {
 
 security.packageHashSync = function (jsonData) {
   var sortedArr = security.sortJsonToArr(jsonData);
-  var manifestData = _.map(sortedArr, function(v){
+  var manifestData = _.map(sortedArr, (v) => {
     return v.path + ':' + v.hash;
   });
+  log.debug('packageHashSync manifestData:', manifestData);
   var manifestString = JSON.stringify(manifestData.sort());
   manifestString = _.replace(manifestString, /\\\//g, '/');
+  log.debug('packageHashSync manifestString:', manifestData);
   return security.stringSha256Sync(manifestString);
 }
 
 //参数为buffer或者readableStream或者文件路径
 security.qetag = function (buffer) {
-  return new Promise(function (resolve, reject) {
-    qetag(buffer, resolve);
-  });
-}
-
-security.qetagString = function (contents) {
-  return new Promise(function (resolve, reject) {
-    var Readable = require('stream').Readable
-    var buffer = new Readable
-    buffer.push(contents)
-    buffer.push(null)
-    qetag(buffer, resolve);
+  if (typeof buffer === 'string') {
+    try {
+      log.debug(`Check upload file ${buffer} fs.R_OK`);
+      fs.accessSync(buffer, fs.R_OK);
+      log.debug(`Pass upload file ${buffer}`);
+    } catch (e) {
+      log.error(e);
+      return Promise.reject(new AppError.AppError(e.message))
+    }
+  }
+  log.debug(`generate file identical`)
+  return new Promise((resolve, reject) => {
+    qetag(buffer, (data)=>{
+      log.debug('identical:', data);
+      resolve(data)
+    });
   });
 }
 
 security.sha256AllFiles = function (files) {
-  return new Promise(function (resolve, reject) {
+  return new Promise((resolve, reject) => {
     var results = {};
     var length = files.length;
     var count = 0;
-    files.forEach(function (file) {
+    files.forEach((file) => {
       security.fileSha256(file)
-      .then(function (hash) {
+      .then((hash) => {
         results[file] = hash;
         count++;
         if (count == length) {
@@ -101,32 +110,35 @@ security.sha256AllFiles = function (files) {
   });
 }
 
-security.isAndroidPackage = function (directoryPath) {
-  return new Promise(function (resolve, reject) {
-    var recursiveFs = require("recursive-fs");
+security.uploadPackageType = function (directoryPath) {
+  return new Promise((resolve, reject) => {
+    var recursive = require("recursive-readdir");
     var path = require('path');
     var slash = require("slash");
-    recursiveFs.readdirr(directoryPath, function (error, directories, files) {
-      if (error) {
-        reject(error);
+    recursive(directoryPath, (err, files) => {
+      if (err) {
+        log.error(new AppError.AppError(err.message));
+        reject(new AppError.AppError(err.message));
       } else {
         if (files.length == 0) {
-          reject(new Error("empty files"));
+          log.debug(`uploadPackageType empty files`);
+          reject(new AppError.AppError("empty files"));
         } else {
           const AREGEX=/android\.bundle/
           const AREGEX_IOS=/main\.jsbundle/
-          var isAndroid = 0;
+          var packageType = 0;
           _.forIn(files, function (value) {
             if (AREGEX.test(value)) {
-              isAndroid = 1;
+              packageType = 1;
               return false;
             }
             if (AREGEX_IOS.test(value)) {
-              isAndroid = 2;
+              packageType = 2;
               return false;
             }
           });
-          resolve(isAndroid);
+          log.debug(`uploadPackageType packageType: ${packageType}`);
+          resolve(packageType);
         }
       }
     });
@@ -134,25 +146,28 @@ security.isAndroidPackage = function (directoryPath) {
 }
 
 security.calcAllFileSha256 = function (directoryPath) {
-  return new Promise(function (resolve, reject) {
-    var recursiveFs = require("recursive-fs");
+  return new Promise((resolve, reject) => {
+    var recursive = require("recursive-readdir");
     var path = require('path');
     var slash = require("slash");
-    recursiveFs.readdirr(directoryPath, function (error, directories, files) {
+    recursive(directoryPath, (error, files) => {
       if (error) {
-        reject(error);
+        log.error(error);
+        reject(new AppError.AppError(error.message));
       } else {
         if (files.length == 0) {
-          reject(new Error("empty files"));
+          log.debug(`calcAllFileSha256 empty files in directoryPath:`, directoryPath);
+          reject(new AppError.AppError("empty files"));
         }else {
           security.sha256AllFiles(files)
-          .then(function (results) {
+          .then((results) => {
             var data = {};
-            _.forIn(results, function (value, key) {
+            _.forIn(results, (value, key) => {
               var relativePath = path.relative(directoryPath, key);
               relativePath = slash(relativePath);
               data[relativePath] = value;
             });
+            log.debug(`calcAllFileSha256 files:`, data);
             resolve(data);
           });
         }
@@ -163,8 +178,8 @@ security.calcAllFileSha256 = function (directoryPath) {
 
 security.sortJsonToArr = function (json) {
   var rs = [];
-  _.forIn(json, function (value, key) {
+  _.forIn(json, (value, key) => {
     rs.push({path:key, hash: value})
   });
-  return _.sortBy(rs, function(o) { return o.path; });
+  return _.sortBy(rs, (o) => o.path);
 }

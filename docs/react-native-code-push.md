@@ -36,7 +36,7 @@ $ npm install code-push-cli@latest -g
 ```shell
 $ react-native init CodePushDemo #初始化一个react-native项目
 $ cd CodePushDemo
-$ npm install --save react-native-code-push  #安装react-native-code-push
+$ npm install --save react-native-code-push@latest  #安装react-native-code-push
 $ react-native link react-native-code-push  #连接到项目中，提示输入配置可以先行忽略
 ```
 
@@ -124,6 +124,16 @@ CodePush.sync({
 import CodePush from "react-native-code-push" 
 ```
 
+> notice: 
+> 
+> demo.js中用到ECMAScript中Decorators语法,需要安装`$ npm install babel-preset-react-native-stage-0 --save`，
+> 同时在.babelrc中添加'react-native-stage-0/decorator-support'.
+> 
+> eg.
+> {
+> "presets": ["react-native", "react-native-stage-0/decorator-support"]
+> }
+
 ## 运行CodePushDemo react-native项目
 
 #### iOS
@@ -160,6 +170,7 @@ $ code-push release-react CodePushDemo-android android -d Production #android版
 - react-native 不同平台bundle包不一样，在使用code-push-server的时候必须创建不同的应用来区分(eg. CodePushDemo-ios 和 CodePushDemo-android)
 - react-native-code-push只更新资源文件,不会更新java和Objective C，所以npm升级依赖包版本的时候，如果依赖包使用的本地化实现, 这时候必须更改应用版本号(ios修改Info.plist中的CFBundleShortVersionString, android修改build.gradle中的versionName), 然后重新编译app发布到应用商店。
 - 推荐使用code-push release-react 命令发布应用，该命令合并了打包和发布命令(eg. code-push release-react CodePushDemo-ios ios -d Production)
+- 每次向App Store提交新的版本时，也应该基于该提交版本同时向code-push-server发布一个初始版本。(因为后面每次向code-push-server发布版本时，code-puse-server都会和初始版本比较，生成补丁版本)
 
 ## 例子
 

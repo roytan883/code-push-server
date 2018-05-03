@@ -1,5 +1,7 @@
 # CodePush Server [source](https://github.com/lisong/code-push-server) 
 
+[![NPM](https://nodei.co/npm/code-push-server.svg?downloads=true&downloadRank=true&stars=true)](https://nodei.co/npm/code-push-server/)
+
 [![NPM Version](https://img.shields.io/npm/v/code-push-server.svg)](https://npmjs.org/package/code-push-server)
 [![Node.js Version](https://img.shields.io/node/v/code-push-server.svg)](https://nodejs.org/en/download/)
 [![Linux Status](https://img.shields.io/travis/lisong/code-push-server/master.svg?label=linux)](https://travis-ci.org/lisong/code-push-server)
@@ -19,19 +21,20 @@ CodePush Server is a CodePush progam server! microsoft CodePush cloud is slow in
 - react-native 不同平台bundle包不一样，在使用code-push-server的时候必须创建不同的应用来区分(eg. CodePushDemo-ios 和 CodePushDemo-android)
 - react-native-code-push只更新资源文件,不会更新java和Objective C，所以npm升级依赖包版本的时候，如果依赖包使用的本地化实现, 这时候必须更改应用版本号(ios修改Info.plist中的CFBundleShortVersionString, android修改build.gradle中的versionName), 然后重新编译app发布到应用商店。
 - 推荐使用code-push release-react 命令发布应用，该命令合并了打包和发布命令(eg. code-push release-react CodePushDemo-ios ios -d Production)
+- 每次向App Store提交新的版本时，也应该基于该提交版本同时向code-push-server发布一个初始版本。(因为后面每次向code-push-server发布版本时，code-puse-server都会和初始版本比较，生成补丁版本)
 
 ## EXAMPLE 
-codepush.19910225.com 只是一个测试server，不要将自己生产环境的项目放在上面，服务器的宽带只有1M，而且服务没有做负载均衡和监控，稳定性不能保证，烦请大家自己搭建自己的服务。
+api.code-push.com 只是一个测试server，不要将自己生产环境的项目放在上面，服务器的宽带只有1M，而且服务没有做负载均衡和监控，稳定性不能保证，烦请大家自己搭建自己的服务。
 
 ### shell命令行端
 
 ```shell
-$ code-push login http://codepush.19910225.com:8080 #登录
+$ code-push login http://api.code-push.com #登录
 ```
 
-### [web](http://codepush-managerment.19910225.com:8080) 
+### [web](http://www.code-push.com) 
 
-访问：http://codepush-managerment.19910225.com:8080
+访问：http://www.code-push.com
 
 ### 客户端eg.
 
@@ -57,6 +60,24 @@ $ ./bin/db init --dbhost localhost --dbuser root --dbpassword #初始化mysql数
 $ ./bin/www #启动服务 浏览器中打开 http://127.0.0.1:3000
 ```
 
+## UPGRADE
+
+*from source code*
+
+```shell
+$ cd /path/to/code-push-server
+$ git pull --rebase origin master
+$ ./bin/db upgrade --dbhost localhost --dbuser root --dbpassword #升级codepush数据库
+$ #restart code-push-server
+```
+
+*from npm package*
+
+```shell
+$ code-push-server-db upgrade --dbhost localhost --dbuser root --dbpassword #升级codepush数据库
+$ #restart code-push-server
+```
+
 ## CONFIG
 ```shell
 $ vim config/config.js
@@ -78,11 +99,22 @@ $ vim config/config.js
     bucketName: "",
     downloadUrl: "" //文件下载域名地址
   },
+  //阿里云存储配置 当storageType为oss时需要配置
+  oss: {
+    accessKeyId: "",
+    secretAccessKey: "",
+    endpoint: "",
+    bucketName: "",
+    prefix: "", // 对象Key的前缀，允许放到子文件夹里面
+    downloadUrl: "", // 文件下载域名地址，需要包含前缀
+  },
   //文件存储在本地配置 当storageType为local时需要配置
   local: {
     storageDir: "/Users/tablee/workspaces/storage",
     //文件下载地址 CodePush Server 地址 + '/download' download对应app.js里面的地址
-    downloadUrl: "http://localhost:3000/download"
+    downloadUrl: "http://localhost:3000/download",
+    // public static download spacename.
+    public: '/download'
   },
   jwt: {
     // 登录jwt签名密钥，必须更改，否则有安全隐患，可以使用随机生成的字符串
@@ -92,7 +124,7 @@ $ vim config/config.js
   },
   common: {
     dataDir: "/Users/tablee/workspaces/data",
-    //选择存储类型，目前支持local和qiniu配置
+    //选择存储类型，目前支持local,oss,qiniu,s3配置
     storageType: "local"
   },
 ```
@@ -192,11 +224,11 @@ edit config.xml. add code below.
 ```xml
 <platform name="android">
     <preference name="CodePushDeploymentKey" value="nVHPr6asLSusnWoLBNCSktk9FWbiqLF160UDg" />
-    <preference name="CodePushServerUrl" value="http://codepush.19910225.com:8080/" />
+    <preference name="CodePushServerUrl" value="http://api.code-push.com/" />
 </platform>
 <platform name="ios">
     <preference name="CodePushDeploymentKey" value="Iw5DMZSIrCOS7hbLsY5tHAHNITFQqLF160UDg" />
-    <preference name="CodePushServerUrl" value="http://codepush.19910225.com:8080/" />
+    <preference name="CodePushServerUrl" value="http://api.code-push.com/" />
 </platform>
 ```
 
@@ -207,9 +239,9 @@ use [pm2](http://pm2.keymetrics.io/) to manage process.
 $ npm install pm2 -g
 $ cp config/config.js /path/to/production/config.js
 $ vim /path/to/production/config.js #configure your env.
-$ cp docs/process.yml /path/to/production/process.yml
-$ vim /path/to/production/process.yml #configure your env.
-$ pm2 start /path/to/production/process.yml
+$ cp docs/process.json /path/to/production/process.json
+$ vim /path/to/production/process.json #configure your env.
+$ pm2 start /path/to/production/process.json
 ```
 
 ## Use [CodePush Web](https://github.com/lisong/code-push-web) manage apps

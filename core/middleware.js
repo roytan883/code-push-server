@@ -4,6 +4,7 @@ var Promise = require('bluebird');
 var security = require('../core/utils/security');
 var models = require('../models');
 var moment = require('moment');
+var AppError = require('./app-error')
 
 var middleware = module.exports
 
@@ -12,53 +13,57 @@ var checkAuthToken = function (authToken) {
   return models.Users.findOne({
     where: {identical: objToken.identical}
   })
-  .then(function(users) {
+  .then((users) => {
     if (_.isEmpty(users)) {
-      throw new Error('401 Unauthorized');
+      throw new AppError.Unauthorized();
     }
     return models.UserTokens.findOne({
       where: {tokens: authToken, uid: users.id, expires_at: { gt: moment().format('YYYY-MM-DD HH:mm:ss') }}
     })
-    .then(function(tokenInfo){
+    .then((tokenInfo) => {
       if (_.isEmpty(tokenInfo)){
-        throw new Error('401 Unauthorized')
+        throw new AppError.Unauthorized()
       }
       return users;
     })
-  }).then(function (users) {
+  }).then((users) => {
     return users;
   })
 }
 
 var checkAccessToken = function (accessToken) {
-  return new Promise(function (resolve, reject) {
+  return new Promise((resolve, reject) => {
     if (_.isEmpty(accessToken)) {
-      throw new Error('401 Unauthorized');
+      throw new AppError.Unauthorized();
     }
     var config = require('../core/config');
     var tokenSecret = _.get(config, 'jwt.tokenSecret');
     var jwt = require('jsonwebtoken');
-    var authData = jwt.verify(accessToken, tokenSecret);
+    try {
+      var authData = jwt.verify(accessToken, tokenSecret);
+    } catch (e) {
+      reject(new AppError.Unauthorized());
+    }
     var uid = _.get(authData, 'uid', null);
     var hash = _.get(authData, 'hash', null);
     if (parseInt(uid) > 0) {
       return models.Users.findOne({
         where: {id: uid}
       })
-      .then(function(users) {
+      .then((users) => {
         if (_.isEmpty(users)) {
-          throw new Error('401 Unauthorized');
+          throw new AppError.Unauthorized();
         }
         if (!_.eq(hash, security.md5(users.get('ack_code')))){
-          throw new Error('401 Unauthorized');
+          throw new AppError.Unauthorized();
         }
         resolve(users);
       })
-      .catch(function (e) {
+      .catch((e) => {
         reject(e);
       });
     } else {
-      throw new Error('401 Unauthorized');
+      reject(new AppError.Unauthorized());
     }
   });
 }
@@ -81,25 +86,33 @@ middleware.checkToken = function(req, res, next) {
   }
   if (authType == 1) {
     checkAuthToken(authToken)
-    .then(function(users) {
+    .then((users) => {
       req.users = users;
       next();
       return users;
     })
-    .catch(function (e) {
-      res.status(401).send(e.message);
+    .catch((e) => {
+      if (e instanceof AppError.AppError) {
+        res.status(e.status || 404).send(e.message);
+      } else {
+        next(e);
+      }
     });
   } else if (authType == 2) {
     checkAccessToken(authToken)
-    .then(function(users) {
+    .then((users) => {
       req.users = users;
       next();
       return users;
     })
-    .catch(function (e) {
-      res.status(401).send(e.message);
+    .catch((e) => {
+      if (e instanceof AppError.AppError) {
+        res.status(e.status || 404).send(e.message);
+      } else {
+        next(e);
+      }
     });
   } else {
-    res.status(401).send('401 Unauthorized');
+    res.send(new AppError.Unauthorized(`Auth type not supported.`));
   }
 };

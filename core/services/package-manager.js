@@ -11,6 +11,9 @@ var slash = require("slash");
 var common = require('../utils/common');
 var os = require('os');
 var path = require('path');
+var AppError = require('../app-error');
+var log4js = require('log4js');
+var log = log4js.getLogger("cps:PackageManager");
 
 var proto = module.exports = function (){
   function PackageManager() {
@@ -25,53 +28,57 @@ proto.getMetricsbyPackageId= function(packageId) {
 }
 
 proto.parseReqFile = function (req) {
-  return new Promise(function (resolve, reject) {
+  log.debug('parseReqFile');
+  return new Promise((resolve, reject) => {
     var form = new formidable.IncomingForm();
-    form.parse(req, function(err, fields, files) {
+    form.parse(req, (err, fields, files) => {
       if (err) {
-        reject(new Error("upload error"));
+        log.debug('parseReqFile:', err);
+        reject(new AppError.AppError("upload error"));
       } else {
-        if (_.isEmpty(fields.packageInfo) || _.isEmpty(files.package)) {
-          reject(new Error("upload info lack"));
+        log.debug('parseReqFile fields:', fields);
+        log.debug('parseReqFile file location:', _.get(files,'package.path'));
+        if (_.isEmpty(fields.packageInfo) || _.isEmpty(_.get(files,'package'))) {
+          log.debug('parseReqFile upload info lack');
+          reject(new AppError.AppError("upload info lack"));
         } else {
-          resolve({packageInfo:JSON.parse(fields.packageInfo), package: files.package});
+          log.debug('parseReqFile is ok');
+          resolve({packageInfo: JSON.parse(fields.packageInfo), package: files.package});
         }
       }
     });
   });
 };
 
-proto.getDeploymentsVersions = function (deploymentId, appVersion) {
-  return models.DeploymentsVersions.findOne({
-    where: {deployment_id: deploymentId, app_version: appVersion}
+proto.createDeploymentsVersionIfNotExist = function (deploymentId, appVersion, t) {
+  return models.DeploymentsVersions.findOrCreate({
+    where: {deployment_id: deploymentId, app_version: appVersion},
+    defaults: {current_package_id: 0},
+    transaction: t
+  })
+  .spread((data, created)=>{
+    if (created) {
+      log.debug(`createDeploymentsVersionIfNotExist findOrCreate version ${appVersion}`);
+    }
+    log.debug(`createDeploymentsVersionIfNotExist version data:`, data.get());
+    return data;
   });
 };
 
-proto.existPackageHashAndCreateVersions = function (deploymentId, appVersion, packageHash) {
-  return this.getDeploymentsVersions(deploymentId, appVersion)
-  .then(function (data) {
-    if (_.isEmpty(data)){
-      return models.DeploymentsVersions.create({
-        deployment_id: deploymentId,
-        app_version: appVersion,
-        is_mandatory: false,
-      }).then(function () {
-        return false;
-      });
-    } else {
-      var packageId = data.current_package_id;
-      if (_.gt(packageId, 0)) {
-        return models.Packages.findById(packageId)
-        .then(function (data) {
-          if (_.eq(_.get(data,"package_hash"), packageHash)){
-            return true;
-          }else {
-            return false;
-          }
-        });
-      }else {
-        return false
-      }
+proto.isMatchPackageHash = function (packageId, packageHash) {
+  if (_.lt(packageId, 0)) {
+    log.debug(`isMatchPackageHash packageId is 0`);
+    return Promise.resolve(false);
+  }
+  return models.Packages.findById(packageId)
+  .then((data) => {
+    if (data && _.eq(data.get('package_hash'), packageHash)){
+      log.debug(`isMatchPackageHash data:`, data.get());
+      log.debug(`isMatchPackageHash packageHash exist`);
+      return true;
+    }else {
+      log.debug(`isMatchPackageHash package is null`);
+      return false;
     }
   });
 };
@@ -84,22 +91,12 @@ proto.createPackage = function (deploymentId, appVersion, packageHash, manifestH
   var description = params.description || "";
   var originalLabel = params.originalLabel || "";
   var originalDeployment = params.originalDeployment || "";
+  var self = this;
   return models.Deployments.generateLabelId(deploymentId)
-  .then(function (labelId) {
-    return models.sequelize.transaction(function (t) {
-      return models.DeploymentsVersions.findOne({where: {deployment_id: deploymentId, app_version: appVersion}})
-      .then(function (deploymentsVersions) {
-        if (!deploymentsVersions) {
-          return models.DeploymentsVersions.create({
-            is_mandatory: isMandatory,
-            current_package_id: 0,
-            deployment_id: deploymentId,
-            app_version: appVersion
-          },{transaction: t});
-        }
-        return deploymentsVersions;
-      })
-      .then(function(deploymentsVersions) {
+  .then((labelId) => {
+    return models.sequelize.transaction((t) => {
+      return self.createDeploymentsVersionIfNotExist(deploymentId, appVersion, t)
+      .then((deploymentsVersions) => {
         return models.Packages.create({
           deployment_version_id: deploymentsVersions.id,
           deployment_id: deploymentId,
@@ -111,29 +108,28 @@ proto.createPackage = function (deploymentId, appVersion, packageHash, manifestH
           release_method: releaseMethod,
           label: "v" + labelId,
           released_by: releaseUid,
+          is_mandatory: isMandatory,
           original_label: originalLabel,
           original_deployment: originalDeployment
         },{transaction: t})
-        .then(function (packages) {
-          deploymentsVersions.set('is_mandatory', isMandatory);
+        .then((packages) => {
           deploymentsVersions.set('current_package_id', packages.id);
           return Promise.all([
             deploymentsVersions.save({transaction: t}),
-            models.Deployments.update({
-              last_deployment_version_id: deploymentsVersions.id
-            },{where: {id: deploymentId}, transaction: t})
+            models.Deployments.update(
+              {last_deployment_version_id: deploymentsVersions.id},
+              {where: {id: deploymentId}, transaction: t}
+            ),
+            models.PackagesMetrics.create(
+              {package_id: packages.id},
+              {transaction: t}
+            ),
+            models.DeploymentsHistory.create(
+              {deployment_id: deploymentId,package_id: packages.id},
+              {transaction: t}
+            )
           ])
-          .then(function () {
-            //插入日志
-            models.DeploymentsHistory.create({
-              deployment_id: deploymentId,
-              package_id: packages.id,
-            })
-            .catch(function(e){
-              console.log(e);
-            });
-            return packages;
-          });
+          .then(() => packages);
         });
       });
     });
@@ -143,15 +139,15 @@ proto.createPackage = function (deploymentId, appVersion, packageHash, manifestH
 proto.downloadPackageAndExtract = function (workDirectoryPath, packageHash, blobHash) {
   var dataCenterManager = require('./datacenter-manager')();
   return dataCenterManager.validateStore(packageHash)
-  .then(function (isValidate) {
+  .then((isValidate) => {
     if (isValidate) {
       return dataCenterManager.getPackageInfo(packageHash);
     } else {
-      var downloadURL = `${common.getDownloadUrl()}/${blobHash}`;
+      var downloadURL = common.getBlobDownloadUrl(blobHash);
       return common.createFileFromRequest(downloadURL, `${workDirectoryPath}/${blobHash}`)
-      .then(function (download) {
+      .then((download) => {
         return common.unzipFile(`${workDirectoryPath}/${blobHash}`, `${workDirectoryPath}/current`)
-        .then(function (outputPath) {
+        .then((outputPath) => {
           return dataCenterManager.storePackage(outputPath, true);
         });
       });
@@ -160,17 +156,17 @@ proto.downloadPackageAndExtract = function (workDirectoryPath, packageHash, blob
 }
 
 proto.zipDiffPackage = function (fileName, files, baseDirectoryPath, hotCodePushFile) {
-  return new Promise(function (resolve, reject) {
+  return new Promise((resolve, reject) => {
     var zipFile = new yazl.ZipFile();
     var writeStream = fs.createWriteStream(fileName);
-    writeStream.on('error', function (error) {
+    writeStream.on('error', (error) => {
       reject(error);
     })
     zipFile.outputStream.pipe(writeStream)
-    .on("error", function (error) {
+    .on("error", (error) => {
       reject(error);
     })
-    .on("close", function () {
+    .on("close", () => {
       resolve({ isTemporary: true, path: fileName });
     });
     for (var i = 0; i < files.length; ++i) {
@@ -190,13 +186,13 @@ proto.generateOneDiffPackage = function (workDirectoryPath, packageId, dataCente
       diff_against_package_hash: diffPackageHash
     }
   })
-  .then(function (diffPackage) {
+  .then((diffPackage) => {
     if (!_.isEmpty(diffPackage)) {
       return;
     }
-    var downloadURL = `${common.getDownloadUrl()}/${diffManifestBlobHash}`;
+    var downloadURL = common.getBlobDownloadUrl(diffManifestBlobHash);
     return common.createFileFromRequest(downloadURL, `${workDirectoryPath}/${diffManifestBlobHash}`)
-    .then(function(){
+    .then(() => {
       var originContentPath = dataCenter.contentPath;
       var originManifestJson = JSON.parse(fs.readFileSync(dataCenter.manifestFilePath, "utf8"))
       var diffManifestJson = JSON.parse(fs.readFileSync(`${workDirectoryPath}/${diffManifestBlobHash}`, "utf8"))
@@ -208,11 +204,12 @@ proto.generateOneDiffPackage = function (workDirectoryPath, packageId, dataCente
       var fileName = `${workDirectoryPath}/${diffManifestBlobHash}.zip`;
 
       return self.zipDiffPackage(fileName, files, originContentPath, hotCodePushFile)
-      .then(function (data) {
+      .then((data) => {
         return security.qetag(data.path)
-        .then(function (diffHash) {
+        .then((diffHash) => {
+          log.debug('diff');
           return common.uploadFileToStorage(diffHash, fileName)
-          .then(function () {
+          .then(() => {
             var stats = fs.statSync(fileName);
             return models.PackagesDiff.create({
               package_id: packageId,
@@ -230,18 +227,30 @@ proto.generateOneDiffPackage = function (workDirectoryPath, packageId, dataCente
 proto.createDiffPackagesByLastNums = function (packageId, num) {
   var self = this;
   return models.Packages.findById(packageId)
-  .then(function (originalPackage) {
+  .then((originalPackage) => {
     if (_.isEmpty(originalPackage)) {
-      throw Error('can\'t find Package');
+      throw AppError.AppError('can\'t find Package');
     }
-    return models.Packages.findAll({
-      where:{
-        deployment_version_id: originalPackage.deployment_version_id,
-        id: {$lt: packageId}},
-        order: [['id','desc']],
-        limit: num
+    return Promise.all([
+      models.Packages.findAll({
+        where:{
+          deployment_version_id: originalPackage.deployment_version_id,
+          id: {$lt: packageId}},
+          order: [['id','desc']],
+          limit: num
+      }),
+      models.Packages.findAll({
+        where:{
+          deployment_version_id: originalPackage.deployment_version_id,
+          id: {$lt: packageId}},
+          order: [['id','asc']],
+          limit: 2
       })
-    .then(function (lastNumsPackages) {
+    ])
+    .spread((lastNumsPackages, basePackages) => {
+      return _.unionBy(lastNumsPackages, basePackages, 'id');
+    })
+    .then((lastNumsPackages) => {
       return self.createDiffPackages(originalPackage, lastNumsPackages);
     });
   });
@@ -249,7 +258,7 @@ proto.createDiffPackagesByLastNums = function (packageId, num) {
 
 proto.createDiffPackages = function (originalPackage, destPackages) {
   if (!_.isArray(destPackages)) {
-    return Promise.reject(new Error('第二个参数必须是数组'));
+    return Promise.reject(new AppError.AppError('第二个参数必须是数组'));
   }
   if (destPackages.length <= 0) {
     return null;
@@ -259,84 +268,90 @@ proto.createDiffPackages = function (originalPackage, destPackages) {
   var manifest_blob_url = _.get(originalPackage, 'manifest_blob_url');
   var blob_url = _.get(originalPackage, 'blob_url');
   var workDirectoryPath = path.join(os.tmpdir(), 'codepush_' + security.randToken(32));
-  common.createEmptyFolderSync(workDirectoryPath);
-  return self.downloadPackageAndExtract(workDirectoryPath, package_hash, blob_url)
-  .then(function (dataCenter) {
-    return Promise.map(destPackages, function (v) {
-      return self.generateOneDiffPackage(workDirectoryPath, originalPackage.id, dataCenter, v.package_hash, v.manifest_blob_url);
-    });
-  })
-  .finally(function () {
-    common.deleteFolderSync(workDirectoryPath);
-  });
+  return common.createEmptyFolder(workDirectoryPath)
+  .then(() => self.downloadPackageAndExtract(workDirectoryPath, package_hash, blob_url))
+  .then((dataCenter) => Promise.map(destPackages,
+    (v) => self.generateOneDiffPackage(workDirectoryPath, originalPackage.id, dataCenter, v.package_hash, v.manifest_blob_url)
+  ))
+  .finally(() => common.deleteFolderSync(workDirectoryPath));
 }
 
 proto.releasePackage = function (deploymentId, packageInfo, fileType, filePath, releaseUid, pubType) {
   var self = this;
   var appVersion = packageInfo.appVersion;
   if (!/^([0-9.]+)$/.test(appVersion)) {
-    return Promise.reject(new Error(`targetBinaryVersion not support.`))
+    log.debug(`releasePackage targetBinaryVersion ${appVersion} not support.`);
+    return Promise.reject(new AppError.AppError(`targetBinaryVersion ${appVersion} not support.`))
   }
   var description = packageInfo.description;
   var isMandatory = packageInfo.isMandatory;
-  var directoryPath = path.join(os.tmpdir(), 'codepush_' + security.randToken(32));
+  var tmpDir = os.tmpdir();
+  var directoryPath = path.join(tmpDir, 'codepush_' + security.randToken(32));
+  log.debug(`releasePackage generate an random dir path: ${directoryPath}`);
   return Promise.all([
     security.qetag(filePath),
     common.createEmptyFolder(directoryPath)
-    .then(function () {
+    .then(() => {
       if (fileType == "application/zip") {
         return common.unzipFile(filePath, directoryPath)
       } else {
-        throw new Error("上传的文件格式不对");
+        log.debug(`上传的文件格式不对`);
+        throw new AppError.AppError("上传的文件格式不对");
       }
     })
   ])
-  .spread(function(blobHash) {
-    return security.isAndroidPackage(directoryPath)
-    .then(function (type) {
+  .spread((blobHash) => {
+    return security.uploadPackageType(directoryPath)
+    .then((type) => {
       if (type === 1) {
         //android
-        if (pubType !== 'android' ) {
-          throw new Error("it must be publish it by android type");
+        if (pubType == 'ios' ) {
+          var e = new AppError.AppError("it must be publish it by ios type");
+          log.debug(e);
+          throw e;
         }
       } else if (type === 2) {
         //ios
-        if (pubType !== 'ios'){
-          throw new Error("it must be publish it by ios type");
+        if (pubType == 'android'){
+          var e = new AppError.AppError("it must be publish it by android type");
+          log.debug(e);
+          throw e;
         }
       } else {
         //不验证
+        log.debug(`Unknown package type`);
       }
-    })
-    .then(function(){
       return blobHash;
-    })
+    });
   })
-  .then(function(blobHash) {
+  .then((blobHash) => {
     var dataCenterManager = require('./datacenter-manager')();
     return dataCenterManager.storePackage(directoryPath)
-    .then(function (dataCenter) {
+    .then((dataCenter) => {
       var packageHash = dataCenter.packageHash;
       var manifestFile = dataCenter.manifestFilePath;
-      return self.existPackageHashAndCreateVersions(deploymentId, appVersion, packageHash)
-      .then(function (isExist) {
+      return self.createDeploymentsVersionIfNotExist(deploymentId, appVersion)
+      .then((deploymentsVersions) => {
+        return self.isMatchPackageHash(deploymentsVersions.get('current_package_id'), packageHash);
+      })
+      .then((isExist) => {
         if (isExist){
-          throw new Error("The uploaded package is identical to the contents of the specified deployment's current release.");
+          var e = new AppError.AppError("The uploaded package is identical to the contents of the specified deployment's current release.");
+          log.debug(e.message);
+          throw e;
         }
         return security.qetag(manifestFile);
       })
-      .then(function (manifestHash) {
+      .then((manifestHash) => {
         return Promise.all([
           common.uploadFileToStorage(manifestHash, manifestFile),
           common.uploadFileToStorage(blobHash, filePath)
         ])
-        .then(function () {
-          return [packageHash, manifestHash, blobHash];
-        });
-      });
+        .then(() => [packageHash, manifestHash, blobHash]);
+      })
     });
   })
-  .spread(function (packageHash, manifestHash, blobHash) {
+  .spread((packageHash, manifestHash, blobHash) => {
     var stats = fs.statSync(filePath);
     var params = {
       releaseMethod: 'Upload',
@@ -347,47 +362,76 @@ proto.releasePackage = function (deploymentId, packageInfo, fileType, filePath, 
     }
     return self.createPackage(deploymentId, appVersion, packageHash, manifestHash, blobHash, params);
   })
-  .finally(function () {
-    common.deleteFolderSync(directoryPath);
+  .finally(() => common.deleteFolderSync(directoryPath))
+};
+
+proto.modifyReleasePackage = function(deploymentId, deploymentVersionId, packageInfo) {
+  var appVersion = _.get(packageInfo, 'appVersion');
+  var description = _.get(packageInfo, 'description');
+  var isMandatory = _.get(packageInfo, 'isMandatory');
+  var isDisabled = _.get(packageInfo, 'isDisabled');
+  return models.DeploymentsVersions.findById(deploymentVersionId)
+  .then((deploymentsVersions) => {
+    if (_.isBoolean(isDisabled)) {
+      throw new AppError.AppError(`--disabled -x function is not implements`);
+    }
+    if (!appVersion) {
+      if (!/^([0-9.]+)$/.test(appVersion)) {
+        return Promise.reject(new AppError.AppError(`targetBinaryVersion ${appVersion} not support.`))
+      }
+      return models.DeploymentsVersions.findOne({deployment_id: deploymentId, app_version: appVersion})
+      .then((d) => {
+        if (d) {
+          throw new AppError.AppError(`version ${appVersion} already exist`);
+        }
+      });
+    }
+    if(!deploymentsVersions) {
+      throw new AppError.AppError(`packages were not found in db`);
+    }
+  })
+  .then(() => {
+
   });
 };
 
 proto.promotePackage = function (sourceDeploymentId, destDeploymentId, promoteUid) {
   var self = this;
   return models.Deployments.findById(sourceDeploymentId)
-  .then(function (sourceDeployment) {
+  .then((sourceDeployment) => {
     var lastDeploymentVersionId = _.get(sourceDeployment, 'last_deployment_version_id', 0);
     if (_.lte(lastDeploymentVersionId, 0)) {
-      throw new Error('does not exist last_deployment_version_id.');
+      throw new AppError.AppError('does not exist last_deployment_version_id.');
     }
     return models.DeploymentsVersions.findById(lastDeploymentVersionId)
-    .then(function (deploymentsVersions) {
+    .then((deploymentsVersions) => {
       var packageId = _.get(deploymentsVersions, 'current_package_id', 0);
       if (_.lte(packageId, 0)) {
-        throw new Error('does not exist packages.');
+        throw new AppError.AppError('does not exist packages.');
       }
       return models.Packages.findById(packageId)
-      .then(function (packages) {
+      .then((packages) => {
         if (!packages) {
-          throw new Error('does not exist packages.');
+          throw new AppError.AppError('does not exist packages.');
         }
-        return self.existPackageHashAndCreateVersions(destDeploymentId, deploymentsVersions.app_version, packages.package_hash)
-        .then(function (isExist) {
+        return self.createDeploymentsVersionIfNotExist(destDeploymentId, deploymentsVersions.app_version)
+        .then((deploymentsVersions) => {
+          return self.isMatchPackageHash(deploymentsVersions.get('current_package_id'), packages.package_hash);
+        })
+        .then((isExist) => {
           if (isExist){
-            throw new Error("The uploaded package is identical to the contents of the specified deployment's current release.");
+            throw new AppError.AppError("The uploaded package is identical to the contents of the specified deployment's current release.");
           }
         })
-        .then(function () {
-          return [sourceDeployment, deploymentsVersions, packages];
-        });
+        .then(() => [sourceDeployment, deploymentsVersions, packages]);
       });
     });
   })
-  .spread(function (sourceDeployment, deploymentsVersions, packages) {
+  .spread((sourceDeployment, deploymentsVersions, packages) => {
     var params = {
       releaseMethod: 'Promote',
       releaseUid: promoteUid,
-      isMandatory: deploymentsVersions.is_mandatory,
+      isMandatory: packages.is_mandatory == 1 ? true : false,
       size: packages.size,
       description: packages.description,
       originalLabel: packages.label,
@@ -400,25 +444,25 @@ proto.promotePackage = function (sourceDeploymentId, destDeploymentId, promoteUi
 proto.rollbackPackage = function (deploymentVersionId, targetLabel, rollbackUid) {
   var self = this;
   return models.DeploymentsVersions.findById(deploymentVersionId)
-  .then(function(deploymentsVersions){
+  .then((deploymentsVersions) => {
     if (!deploymentsVersions) {
-      throw new Error("您之前还没有发布过版本");
+      throw new AppError.AppError("您之前还没有发布过版本");
     }
     return models.Packages.findById(deploymentsVersions.current_package_id)
-    .then(function (currentPackageInfo){
+    .then((currentPackageInfo) => {
       if (targetLabel) {
         return models.Packages.findAll({where: {deployment_version_id: deploymentVersionId, label: targetLabel}, limit: 1})
-        .then(function(rollbackPackageInfos) {
+        .then((rollbackPackageInfos) => {
           return [currentPackageInfo, rollbackPackageInfos]
         });
       } else {
         return self.getCanRollbackPackages(deploymentVersionId)
-        .then(function(rollbackPackageInfos) {
+        .then((rollbackPackageInfos) => {
           return [currentPackageInfo, rollbackPackageInfos]
         });
       }
     })
-    .spread(function (currentPackageInfo, rollbackPackageInfos){
+    .spread((currentPackageInfo, rollbackPackageInfos) => {
       if (currentPackageInfo && rollbackPackageInfos.length > 0) {
         for (var i = rollbackPackageInfos.length - 1; i >= 0; i--) {
           if (rollbackPackageInfos[i].package_hash != currentPackageInfo.package_hash) {
@@ -426,13 +470,13 @@ proto.rollbackPackage = function (deploymentVersionId, targetLabel, rollbackUid)
           }
         }
       }
-      throw new Error("没有可供回滚的版本");
+      throw new AppError.AppError("没有可供回滚的版本");
     })
-    .then(function(rollbackPackage){
+    .then((rollbackPackage) => {
       var params = {
         releaseMethod: 'Rollback',
         releaseUid: rollbackUid,
-        isMandatory: deploymentsVersions.is_mandatory,
+        isMandatory: rollbackPackage.is_mandatory == 1 ? true : false,
         size: rollbackPackage.size,
         description: rollbackPackage.description,
         originalLabel: rollbackPackage.label,
@@ -444,7 +488,7 @@ proto.rollbackPackage = function (deploymentVersionId, targetLabel, rollbackUid)
         rollbackPackage.manifest_blob_url,
         rollbackPackage.blob_url,
         params
-        );
+      );
     });
   });
 }

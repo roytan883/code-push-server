@@ -10,13 +10,13 @@ module.exports = function(sequelize, DataTypes) {
     },
     deployment_id: DataTypes.INTEGER(10),
     app_version: DataTypes.STRING,
-    is_mandatory: DataTypes.INTEGER(3),
     current_package_id: DataTypes.INTEGER(10),
     created_at: DataTypes.DATE,
     updated_at: DataTypes.DATE,
   }, {
     tableName: 'deployments_versions',
     underscored: true,
+    paranoid: true
   });
 
   return DeploymentsVersions;

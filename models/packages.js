@@ -20,11 +20,13 @@ module.exports = function(sequelize, DataTypes) {
     original_label: DataTypes.STRING,
     original_deployment: DataTypes.STRING,
     released_by: DataTypes.STRING,
+    is_mandatory: DataTypes.INTEGER(3),
     created_at: DataTypes.DATE,
     updated_at: DataTypes.DATE,
   }, {
     tableName: 'packages',
     underscored: true,
+    paranoid: true
   });
 
   return Packages;

@@ -2,18 +2,23 @@
 var Promise = require('bluebird');
 var fs = require("fs");
 var fsextra = require("fs-extra");
-var unzip = require('node-unzip-2');
+var extract = require('extract-zip')
 var config    = require('../config');
 var _ = require('lodash');
+var validator = require('validator');
 var qiniu = require("qiniu");
 var common = {};
+var AppError = require('../app-error');
+var log4js = require('log4js');
+var log = log4js.getLogger("cps:utils:common");
 module.exports = common;
 
 common.createFileFromRequest = function (url, filePath) {
-  return new Promise(function (resolve, reject) {
+  return new Promise((resolve, reject) => {
     fs.exists(filePath, function (exists) {
       if (!exists) {
         var request = require('request');
+        log.debug(`createFileFromRequest url:${url}`)
         request(url).on('error', function (error) {
           reject(error);
         })
@@ -39,22 +44,27 @@ common.createFileFromRequest = function (url, filePath) {
 }
 
 common.move = function (sourceDst, targertDst) {
-  return new Promise(function (resolve, reject) {
+  return new Promise((resolve, reject) => {
     fsextra.move(sourceDst, targertDst, {clobber: true, limit: 16}, function (err) {
       if (err) {
-        return reject(err);
+        log.error(err);
+        reject(err);
+      } else {
+        log.debug(`move success sourceDst:${sourceDst} targertDst:${targertDst}`);
+        resolve();
       }
-      resolve();
     });
   });
 };
 
 common.deleteFolder = function (folderPath) {
-  return new Promise(function (resolve, reject) {
+  return new Promise((resolve, reject) => {
     fsextra.remove(folderPath, function (err) {
       if (err) {
+        log.error(err);
         reject(err);
       }else {
+        log.debug(`deleteFolder delete ${folderPath} success.`);
         resolve(null);
       }
     });
@@ -66,11 +76,14 @@ common.deleteFolderSync = function (folderPath) {
 };
 
 common.createEmptyFolder = function (folderPath) {
-  return new Promise(function (resolve, reject) {
-    common.deleteFolder(folderPath).then(function (data) {
-      fsextra.mkdirs(folderPath, function (err) {
+  return new Promise((resolve, reject) => {
+    log.debug(`createEmptyFolder Create dir ${folderPath}`);
+    return common.deleteFolder(folderPath)
+    .then((data) => {
+      fsextra.mkdirs(folderPath, (err) => {
         if (err) {
-          reject(new Error("create error"));
+          log.error(err);
+          reject(new AppError.AppError(err.message));
         } else {
           resolve(folderPath);
         }
@@ -85,28 +98,33 @@ common.createEmptyFolderSync = function (folderPath) {
 };
 
 common.unzipFile = function (zipFile, outputPath) {
-  return new Promise(function (resolve, reject) {
+  return new Promise((resolve, reject) => {
     try {
-      fs.exists(zipFile, function(exists){
-        if (!exists) {
-          reject(new Error("zipfile not found!"))
-        }
-        var readStream = fs.createReadStream(zipFile);
-        var extract = unzip.Extract({ path: outputPath });
-        readStream.pipe(extract);
-        extract.on("close", function () {
-          resolve(outputPath);
-        });
-      })
+      log.debug(`unzipFile check zipFile ${zipFile} fs.R_OK`);
+      fs.accessSync(zipFile, fs.R_OK);
+      log.debug(`Pass unzipFile file ${zipFile}`);
     } catch (e) {
-      reject(e)
+      log.error(e);
+      return reject(new AppError.AppError(e.message))
     }
+    extract(zipFile, {dir: outputPath}, function(err){
+      if (err) {
+        log.error(err);
+        reject(new AppError.AppError(`it's not a zipFile`))
+      } else {
+        log.debug(`unzipFile success`);
+        resolve(outputPath);
+      }
+    });
   });
 };
 
-common.uptoken = function (bucket, key) {
-  var putPolicy = new qiniu.rs.PutPolicy(bucket+":"+key);
-  return putPolicy.token();
+common.getUploadTokenQiniu = function (mac, bucket, key) {
+  var options = {
+    scope: bucket + ":" + key
+  }
+  var putPolicy = new qiniu.rs.PutPolicy(options);
+  return putPolicy.uploadToken(mac);
 };
 
 common.uploadFileToStorage = function (key, filePath) {
@@ -114,74 +132,124 @@ common.uploadFileToStorage = function (key, filePath) {
     return common.uploadFileToLocal(key, filePath);
   } else if (_.get(config, 'common.storageType') === 's3') {
     return common.uploadFileToS3(key, filePath);
+  } else if (_.get(config, 'common.storageType') === 'oss') {
+    return common.uploadFileToOSS(key, filePath);
   }
   return common.uploadFileToQiniu(key, filePath);
 };
 
 common.uploadFileToLocal = function (key, filePath) {
-  return new Promise(function (resolve, reject) {
+  return new Promise((resolve, reject) => {
     var storageDir = _.get(config, 'local.storageDir');
     if (!storageDir) {
-      throw new Error('please set config local storageDir');
+      throw new AppError.AppError('please set config local storageDir');
     }
-    if (!fs.existsSync(storageDir)) {
-      throw new Error(`please create dir ${storageDir}`);
+    if (key.length < 3) {
+      log.error(`generate key is too short, key value:${key}`);
+      throw new AppError.AppError('generate key is too short.');
     }
-    fs.accessSync(storageDir, fs.W_OK);
+    try {
+      log.debug(`uploadFileToLocal check directory ${storageDir} fs.R_OK`);
+      fs.accessSync(storageDir, fs.W_OK);
+      log.debug(`uploadFileToLocal directory ${storageDir} fs.R_OK is ok`);
+    } catch (e) {
+      log.error(e);
+      throw new AppError.AppError(e.message);
+    }
+    var subDir = key.substr(0, 2).toLowerCase();
+    var finalDir = `${storageDir}/${subDir}`;
+    var fileName = `${finalDir}/${key}`;
+    if (fs.existsSync(fileName)) {
+      return resolve(key);
+    }
     var stats = fs.statSync(storageDir);
     if (!stats.isDirectory()) {
-      throw new Error(`${storageDir} must be directory`);
+      var e = new AppError.AppError(`${storageDir} must be directory`);
+      log.error(e);
+      throw e;
     }
-    fs.accessSync(filePath, fs.R_OK);
+    if (!fs.existsSync(`${finalDir}`)) {
+      fs.mkdirSync(`${finalDir}`);
+      log.debug(`uploadFileToLocal mkdir:${finalDir}`);
+    }
+    try {
+     fs.accessSync(filePath, fs.R_OK);
+    } catch (e) {
+      log.error(e);
+      throw new AppError.AppError(e.message);
+    }
     stats = fs.statSync(filePath);
     if (!stats.isFile()) {
-      throw new Error(`${filePath} must be file`);
+      var e = new AppError.AppError(`${filePath} must be file`);
+      log.error(e);
+      throw e;
     }
-    fsextra.copy(filePath, `${storageDir}/${key}`, {clobber: true, limit: 16}, function (err) {
+    fsextra.copy(filePath, fileName,(err) => {
       if (err) {
-        return reject(err);
+        log.error(new AppError.AppError(err.message));
+        return reject(new AppError.AppError(err.message));
       }
+      log.debug(`uploadFileToLocal copy file ${key} success.`);
       resolve(key);
     });
   });
 };
 
-common.getDownloadUrl = function () {
-  if (_.get(config, 'common.storageType') === 'local') {
-    return _.get(config, 'local.downloadUrl');
-  } else if (_.get(config, 'common.storageType') === 's3') {
-    return _.get(config, 's3.downloadUrl');
-  }
-  return _.get(config, 'qiniu.downloadUrl');
-}
-
 common.getBlobDownloadUrl = function (blobUrl) {
-  return `${common.getDownloadUrl()}/${blobUrl}`
+  var fileName = blobUrl;
+  var storageType = _.get(config, 'common.storageType');
+  var downloadUrl = _.get(config, `${storageType}.downloadUrl`);
+  if ( storageType === 'local') {
+    fileName = blobUrl.substr(0, 2).toLowerCase() + '/' + blobUrl;
+  }
+  if (!validator.isURL(downloadUrl)) {
+    var e = new AppError.AppError(`Please config ${storageType}.downloadUrl in config.js`);
+    log.error(e);
+    throw e;
+  }
+  return `${downloadUrl}/${fileName}`
 };
 
+
 common.uploadFileToQiniu = function (key, filePath) {
-  return new Promise(function (resolve, reject) {
-    qiniu.conf.ACCESS_KEY = _.get(config, "qiniu.accessKey");
-    qiniu.conf.SECRET_KEY = _.get(config, "qiniu.secretKey");
-    var bucket = _.get(config, "qiniu.bucketName", "jukang");
-    var client = new qiniu.rs.Client();
-    client.stat(bucket, key, function(err, ret) {
-      if (!err) {
-        resolve(ret.hash);
+  return new Promise((resolve, reject) => {
+    var accessKey = _.get(config, "qiniu.accessKey");
+    var secretKey = _.get(config, "qiniu.secretKey");
+    var bucket = _.get(config, "qiniu.bucketName", "");
+    var mac = new qiniu.auth.digest.Mac(accessKey, secretKey);
+    var conf = new qiniu.conf.Config();
+    var bucketManager = new qiniu.rs.BucketManager(mac, conf);
+    bucketManager.stat(bucket, key, (respErr, respBody, respInfo) => {
+      if (respErr) {
+        log.debug('uploadFileToQiniu file stat:', respErr);
+        return reject(new AppError.AppError(respErr.message));
+      }
+      log.debug('uploadFileToQiniu file stat respBody:', respBody);
+      log.debug('uploadFileToQiniu file stat respInfo:', respInfo);
+      if (respInfo.statusCode == 200) {
+        resolve(respBody.hash);
       } else {
         try {
-          var uptoken = common.uptoken(bucket, key);
+          var uploadToken = common.getUploadTokenQiniu(mac, bucket, key);
         } catch (e) {
-          reject(e);
+          return reject(new AppError.AppError(e.message));
         }
-        var extra = new qiniu.io.PutExtra();
-        qiniu.io.putFile(uptoken, key, filePath, extra, function(err, ret) {
-          if(!err) {
-            // 上传成功， 处理返回值
-            resolve(ret.hash);
-          } else {
+        var formUploader = new qiniu.form_up.FormUploader(conf);
+        var putExtra = new qiniu.form_up.PutExtra();
+        formUploader.putFile(uploadToken, key, filePath, putExtra, (respErr, respBody, respInfo) => {
+          if(respErr) {
+            log.error('uploadFileToQiniu putFile:', respErr);
             // 上传失败， 处理返回代码
-            reject(new Error(JSON.stringify(err)));
+            return reject(new AppError.AppError(JSON.stringify(respErr)));
+          } else {
+            log.debug('uploadFileToQiniu putFile respBody:', respBody);
+            log.debug('uploadFileToQiniu putFile respInfo:', respInfo);
+            // 上传成功， 处理返回值
+            if (respInfo.statusCode == 200) {
+              return resolve(respBody.hash);
+            } else {
+              return reject(new AppError.AppError(respBody.error));
+            }
           }
         });
       }
@@ -192,21 +260,24 @@ common.uploadFileToQiniu = function (key, filePath) {
 common.uploadFileToS3 = function (key, filePath) {
   var AWS = require('aws-sdk');
   return (
-    new Promise(function(resolve, reject) {
+    new Promise((resolve, reject) => {
       AWS.config.update({
+        accessKeyId: _.get(config, 's3.accessKeyId'),
+        secretAccessKey: _.get(config, 's3.secretAccessKey'),
+        sessionToken: _.get(config, 's3.sessionToken'),
         region: _.get(config, 's3.region')
       });
       var s3 = new AWS.S3({
         params: {Bucket: _.get(config, 's3.bucketName')}
       });
-      fs.readFile(filePath, function(err, data) {
+      fs.readFile(filePath, (err, data) => {
         s3.upload({
           Key: key,
           Body: data,
           ACL:'public-read',
-        }, function(err, response) {
+        }, (err, response) => {
           if(err) {
-            reject(new Error(JSON.stringify(err)));
+            reject(new AppError.AppError(JSON.stringify(err)));
           } else {
             resolve(response.ETag)
           }
@@ -214,6 +285,34 @@ common.uploadFileToS3 = function (key, filePath) {
       });
     })
   );
+};
+
+common.uploadFileToOSS = function (key, filePath) {
+  var ALY = require('aliyun-sdk');
+  var ossStream = require('aliyun-oss-upload-stream')(new ALY.OSS({
+    accessKeyId:  _.get(config, 'oss.accessKeyId'),
+    secretAccessKey: _.get(config, 'oss.secretAccessKey'),
+    endpoint: _.get(config, 'oss.endpoint'),
+    apiVersion: '2013-10-15',
+  }));
+  if (!_.isEmpty(_.get(config, 'oss.prefix', ""))) {
+    key = `${_.get(config, 'oss.prefix')}/${key}`;
+  }
+  var upload = ossStream.upload({
+    Bucket: _.get(config, 'oss.bucketName'),
+    Key: key,
+  });
+
+  return new Promise((resolve, reject) => {
+    upload.on('error', (error) => {
+      reject(error);
+    });
+
+    upload.on('uploaded', (details) => {
+      resolve(details.ETag);
+    });
+    fs.createReadStream(filePath).pipe(upload);
+  });
 };
 
 common.diffCollectionsSync = function (collection1, collection2) {
